@@ -15,3 +15,6 @@ models/
 *.user
 Thumbs.db
 desktop.ini
+
+# 临时下载的 UI 资产包（用完即删）
+dist.tar.gz

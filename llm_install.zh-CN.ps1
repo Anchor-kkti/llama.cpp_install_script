@@ -162,28 +162,55 @@ function Get-CMakeVersion {
 }
 
 # 定位带 C++ 工具集的 Visual Studio
-function Get-VisualStudioPath {
+# 定位 vswhere.exe。除两个标准位置外，也接受已经在 PATH 里的那份：
+# Visual Studio 可能装在别处，其 Installer 的注册位置也可能不在默认路径。
+function Get-VsWherePath {
     $candidates = @(
         (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'),
         (Join-Path $env:ProgramFiles 'Microsoft Visual Studio\Installer\vswhere.exe')
     )
-    $vswhere = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-    if (-not $vswhere) { return $null }
-    $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
-    if ($p) { return ("$p").Trim() }
+    foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
+    $cmd = Get-Command 'vswhere' -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
     return $null
 }
 
-# 由 Visual Studio 安装路径推出 CMake 生成器名
-function Get-VisualStudioGenerator ([string]$VsPath) {
-    if ($VsPath -match 'Microsoft Visual Studio\\(\d{2,4})\\') {
-        switch ($Matches[1]) {
-            '18'   { return 'Visual Studio 18 2026' }
-            '17'   { return 'Visual Studio 17 2022' }
-            '16'   { return 'Visual Studio 16 2019' }
-            '2019' { return 'Visual Studio 16 2019' }
-            '2022' { return 'Visual Studio 17 2022' }
+function Get-VisualStudioPath {
+    $vswhere = Get-VsWherePath
+    if (-not $vswhere) { return $null }
+    $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    if ($p) { return ("$p").Trim() }
+    # 回退：vswhere 本身属于 VS Installer，可能缺失（被卸载、精简、移动过）。
+    # Visual Studio 会把每个实例记录在 ProgramData 下，直接读那里。
+    # 注意：注册表不可用 —— 自 2017 的安装模型起，它根本不保存安装路径。
+    $instRoot = Join-Path $env:ProgramData 'Microsoft\VisualStudio\Packages\_Instances'
+    if (Test-Path $instRoot) {
+        foreach ($d in (Get-ChildItem $instRoot -Directory -ErrorAction SilentlyContinue)) {
+            $sj = Join-Path $d.FullName 'state.json'
+            if (-not (Test-Path $sj)) { continue }
+            try {
+                $s = Get-Content $sj -Raw | ConvertFrom-Json
+                if ($s.installationPath -and (Test-Path $s.installationPath)) { return [string]$s.installationPath }
+            } catch { }
         }
+    }
+    return $null
+}
+
+# 生成器名改用 vswhere 报告的版本号推导，不再从安装路径猜：
+# Visual Studio 可以装在任意目录（C:\VS2022、D:\Tools\VS 等），
+# 靠路径匹配在自定义安装位置下会失效。
+function Get-VisualStudioGenerator {
+    $vswhere = Get-VsWherePath
+    if (-not $vswhere) { return $null }
+    $ver = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion 2>$null
+    if (-not $ver) { return $null }
+    $major = ([string]$ver).Trim().Split('.')[0]
+    switch ($major) {
+        '18' { return 'Visual Studio 18 2026' }
+        '17' { return 'Visual Studio 17 2022' }
+        '16' { return 'Visual Studio 16 2019' }
+        '15' { return 'Visual Studio 15 2017' }
     }
     return $null
 }
@@ -297,7 +324,7 @@ $vsCl = $null
 if ($Toolchain -ne 'gcc') {
     $vsPath = Get-VisualStudioPath
     if ($vsPath) {
-        $vsGenerator = Get-VisualStudioGenerator $vsPath
+        $vsGenerator = Get-VisualStudioGenerator
         $vsCl = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Directory -ErrorAction SilentlyContinue |
                 Sort-Object Name -Descending |
                 ForEach-Object { Join-Path $_.FullName 'bin\Hostx64\x64\cl.exe' } |
