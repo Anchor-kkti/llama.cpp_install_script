@@ -91,6 +91,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Windows PowerShell 5.1 defaults $OutputEncoding to US-ASCII, which turns any
+# non-ASCII text piped to a native program into '?'. Pin it to UTF-8.
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 # The session may have started before the toolchain was installed, in which case
 # its PATH is stale. PATH lives in two places (machine and user), so take both.
 $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -934,7 +938,10 @@ if (-not $NoVerify) {
     if ($WithTests) {
         Write-Log ''
         Write-Note 'Running ctest:'
-        Invoke-External { & ctest --test-dir $BuildDir -C $BuildType --output-on-failure --parallel $Jobs }
+        # --test-dir needs CMake 3.20+, so change directory for compatibility
+        Push-Location $BuildDir
+        try { Invoke-External { & ctest -C $BuildType --output-on-failure --parallel $Jobs } }
+        finally { Pop-Location }
         if ($LASTEXITCODE -eq 0) { Write-Ok 'ctest passed' } else { Write-Warn "ctest exit code $LASTEXITCODE" }
     }
 }

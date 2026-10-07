@@ -88,6 +88,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Windows PowerShell 5.1 的 $OutputEncoding 默认是 US-ASCII，任何非 ASCII 文本
+# 经管道传给原生程序都会变成 "?"。这里固定为 UTF-8。
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 # 本会话可能是在工具装好之前启动的，PATH 会是旧的。PATH 存在机器级和用户级两处，
 # 必须都取，否则刚装的 gcc / cmake 会被漏检。
 $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -920,7 +924,10 @@ if (-not $NoVerify) {
     if ($WithTests) {
         Write-Log ''
         Write-Note '运行 ctest：'
-        Invoke-External { & ctest --test-dir $BuildDir -C $BuildType --output-on-failure --parallel $Jobs }
+        # --test-dir 需要 CMake 3.20+，改用切换目录以兼容 3.14+
+        Push-Location $BuildDir
+        try { Invoke-External { & ctest -C $BuildType --output-on-failure --parallel $Jobs } }
+        finally { Pop-Location }
         if ($LASTEXITCODE -eq 0) { Write-Ok 'ctest 全部通过' } else { Write-Warn "ctest 退出码 $LASTEXITCODE" }
     }
 }
