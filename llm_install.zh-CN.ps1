@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     llama.cpp 编译脚本 —— Windows / PowerShell 版
 
@@ -161,7 +161,6 @@ function Get-CMakeVersion {
     return $null
 }
 
-# 定位带 C++ 工具集的 Visual Studio
 # 定位 vswhere.exe。除两个标准位置外，也接受已经在 PATH 里的那份：
 # Visual Studio 可能装在别处，其 Installer 的注册位置也可能不在默认路径。
 function Get-VsWherePath {
@@ -175,11 +174,14 @@ function Get-VsWherePath {
     return $null
 }
 
+# 定位带 C++ 工具集的 Visual Studio
 function Get-VisualStudioPath {
     $vswhere = Get-VsWherePath
-    if (-not $vswhere) { return $null }
-    $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
-    if ($p) { return ("$p").Trim() }
+    # 注意：vswhere 缺失时不能直接 return，否则下面的 ProgramData 回退永远不会执行
+    if ($vswhere) {
+        $p = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if ($p) { return ("$p").Trim() }
+    }
     # 回退：vswhere 本身属于 VS Installer，可能缺失（被卸载、精简、移动过）。
     # Visual Studio 会把每个实例记录在 ProgramData 下，直接读那里。
     # 注意：注册表不可用 —— 自 2017 的安装模型起，它根本不保存安装路径。
@@ -252,8 +254,8 @@ function Invoke-External ([scriptblock]$Command) {
     $ErrorActionPreference = 'Continue'
     try {
         & $Command 2>&1 | ForEach-Object {
-            # Native stderr arrives as an ErrorRecord here; take its message text
-            # instead of letting it stringify to the exception type name.
+            # 原生程序的 stderr 在这里会以 ErrorRecord 的形式到达，
+            # 取它的消息文本，避免被字符串化成异常类型名。
             $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
             Write-Log $line
         }
@@ -457,8 +459,8 @@ function Get-BackendState ([string]$Name) {
             return 'ok'
         }
         'ZenDNN' {
-            # per ggml-zendnn/CMakeLists.txt: an empty ZENDNN_ROOT makes the build
-            # download and compile ZenDNN itself, so this is not a hard blocker
+            # 依据 ggml-zendnn/CMakeLists.txt：ZENDNN_ROOT 为空时，构建过程会自己
+            # 下载并编译 ZenDNN，所以这里不算硬拦截，只标记为「存疑」。
             if ($zendnnReady) { return 'ok' }
             return 'warn'
         }
@@ -504,7 +506,7 @@ if ($gdbPath) { Write-Ok "gdb  ->  $gdbPath" } else { Write-Warn 'gdb  未找到
 Write-Log ''
 Write-Log '  MSVC (Visual Studio)：' -ForegroundColor DarkGray
 if ($vsPath)      { Write-Ok "Visual Studio  ->  $vsPath" } else { Write-Warn '未找到装了 C++ 工作负载的 Visual Studio' }
-if ($vsGenerator) { Write-Ok "生成器         ->  $vsGenerator" }
+if ($vsGenerator) { Write-Ok "VS 生成器可用  ->  $vsGenerator（仅在没找到 ninja 时才会用它）" }
 if ($vsCl)        { Write-Ok "cl.exe         ->  $vsCl" }
 
 Write-Log ''
@@ -538,11 +540,41 @@ if ($use -eq 'gcc' -and -not $gdbPath) {
     Write-Warn 'gdb 缺失：不影响编译，但 -BuildType Debug/RelWithDebInfo 就没有东西可调了'
 }
 
-# --- GCC 路径需要生成器：ninja 优先，其次 mingw32-make / make ---
+# --- 生成器选择：三条件都优先 ninja ---
+# Ninja 在受限环境（沙箱、部分安全软件）里可能无法创建子进程：configure 的第一个
+# try_compile 会永久挂住，而且没有任何报错。所以先用一个最小任务探一次能否启动
+# 子进程，探不通就换生成器 —— 宁可退化，也不能无声挂死。
+function Test-NinjaSpawn ([string]$NinjaPath) {
+    $probeDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ninja_probe_' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $probeDir -Force -ErrorAction SilentlyContinue | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $probeDir 'build.ninja') -Encoding ascii -Value @'
+rule probe
+  command = cmd /c echo ok > probe.txt
+build probe.txt: probe
+'@
+        $proc = Start-Process -FilePath $NinjaPath -ArgumentList 'probe.txt' -WorkingDirectory $probeDir -PassThru -WindowStyle Hidden
+        if (-not $proc.WaitForExit(20000)) { try { $proc.Kill() } catch { }; return $false }
+        return (Test-Path -LiteralPath (Join-Path $probeDir 'probe.txt'))
+    }
+    catch { return $false }
+    finally { Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 $generator = $null
+$useNinja = $false
+$ninjaPath = Get-ToolPath 'ninja'
+$ninjaUsable = $false
+if ($ninjaPath) {
+    $ninjaUsable = Test-NinjaSpawn $ninjaPath
+    if (-not $ninjaUsable) {
+        Write-Warn 'ninja 无法启动子进程（受限沙箱或安全软件拦截），本次不启用 Ninja'
+        Write-Note '在正常桌面终端里运行本脚本一般不会出现这种情况'
+    }
+}
 if ($use -eq 'gcc') {
-    if (Get-ToolPath 'ninja') {
-        $generator = 'Ninja'; Write-Ok "ninja  ->  $((Get-ToolPath 'ninja'))"
+    if ($ninjaUsable) {
+        $generator = 'Ninja'; $useNinja = $true; Write-Ok "ninja  ->  $ninjaPath"
     }
     elseif (Get-ToolPath 'mingw32-make') {
         $generator = 'MinGW Makefiles'; Write-Ok "mingw32-make  ->  $((Get-ToolPath 'mingw32-make'))"
@@ -551,14 +583,51 @@ if ($use -eq 'gcc') {
         $generator = 'MinGW Makefiles'; Write-Ok "make  ->  $((Get-ToolPath 'make'))"
     }
     else {
-        Write-Bad 'ninja / mingw32-make / make 都没有（GCC 路线需要其中之一）'
+        Write-Bad 'GCC 路线没有可用生成器：ninja 在此环境不可用，也没找到 mingw32-make / make'
         Write-Note 'MSYS2 UCRT64: pacman -S mingw-w64-ucrt-x86_64-ninja'
         $missing += 'ninja-or-make'
     }
 }
 else {
-    # Visual Studio 生成器自己驱动 MSBuild，不需要 ninja/make
-    $generator = $vsGenerator
+    # MSVC 也优先 Ninja。Visual Studio 生成器驱动的是 MSBuild，而 MSBuild 在高并发
+    # 下有一批固有问题：命名信号量（MSB4018）、公共目录创建竞态（MSB3191）、
+    # 文件追踪器写追踪文件失败（MSB6003）、链接器临时文件（LNK1104）。
+    # Ninja 建目录走的是原子原语、不创建这些内核对象，可以整体绕开。
+    if ($ninjaUsable) {
+        $generator = 'Ninja'
+        $useNinja = $true
+        Write-Ok "ninja  ->  $ninjaPath"
+    }
+    else {
+        $generator = $vsGenerator
+        Write-Ok "生成器         ->  $vsGenerator（没有可用的 ninja，仍走 MSBuild）"
+    }
+}
+
+# Ninja 走 MSVC 时，必须先把 Visual Studio 的开发环境导进来。
+# Visual Studio 生成器由 MSBuild 驱动，MSBuild 自带完整环境（INCLUDE / LIB / PATH
+# 都指向 Windows SDK）；而 Ninja 只从我们这里拿到一个 cl.exe 的路径，什么都缺，
+# 于是链接阶段找不到资源编译器与清单工具：
+#     RC Pass 1: command "rc /fo .../manifest.res ..." failed
+#     no such file or directory
+# vcvars64.bat 正是用来铺设这套环境的，这里把它的结果导入本进程。
+if ($useNinja -and $use -ne 'gcc') {
+    $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+    if (Test-Path -LiteralPath $vcvars) {
+        $dump = & cmd /c "`"$vcvars`" >nul 2>&1 && set" 2>$null
+        $imported = 0
+        foreach ($line in $dump) {
+            if ($line -match '^([^=]+)=(.*)$') {
+                [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+                $imported++
+            }
+        }
+        Write-Ok "vcvars64.bat  ->  已导入 $imported 个环境变量"
+    }
+    else {
+        Write-Warn "未找到 vcvars64.bat，Ninja 可能因缺少 rc.exe / mt.exe 而链接失败"
+        Write-Note "预期位置：$vcvars"
+    }
 }
 
 if ($missing.Count -gt 0) {
@@ -776,7 +845,9 @@ if (($Backend -contains 'OpenVINO') -and $ovSetup) {
     try { & $ovSetup 2>&1 | ForEach-Object { Write-Note "$_" } } catch { Write-Warn "setupvars.ps1 执行失败：$(($_.Exception.Message -split "`r?`n")[0])" }
 }
 
-$cmakeArgs = @('-S', $SourceDir, '-B', $BuildDir, '-G', $generator)
+# -Wno-dev 压掉 CMake 的开发者警告（例如 CMP194「MSVC is not an assembler for ASM」），
+# 不影响真正的 error。
+$cmakeArgs = @('-S', $SourceDir, '-B', $BuildDir, '-G', $generator, '-Wno-dev')
 
 # FindOpenCL 不会自动去 CUDA 目录里找，所以把找到的路径显式传过去
 if ($Backend -contains 'OpenVINO') {
@@ -804,27 +875,54 @@ elseif ($use -eq 'gcc') {
     }
 }
 else {
-    $cmakeArgs += @('-A', 'x64')
+    if ($useNinja) {
+        # Ninja 是单配置生成器：构建类型在配置期给定，编译期不再传 --config。
+        # cl.exe 不在 PATH 上，必须把编译器路径和 ninja 路径都显式交出去。
+        #
+        # 调试信息格式必须指定为 Embedded（/Z7）。默认是 ProgramDatabase（/Zi），
+        # 也就是让 cl.exe 把调试信息写进 .pdb；而写 .pdb 不是 cl.exe 自己做的，
+        # 是通过后台服务 mspdbsrv.exe，两者之间走「命名管道」。
+        # 这台机器不允许创建这类进程间通信用的内核对象，于是 PDB 永远打不开，
+        # 报成：
+        #   fatal error C1041: 无法打开程序数据库 "...\vc140.pdb"；
+        #       如果要将多个 CL.EXE 写入同一个 .PDB 文件，请使用 /FS
+        # 加 /FS 没有用 —— 它只让写 PDB 串行化，并不取消 mspdbsrv.exe 这条链路。
+        # 改 /Z7 后调试信息直接嵌进各 .obj，完全不碰 .pdb，问题从根上消失。
+        $cmakeArgs += @(
+            "-DCMAKE_BUILD_TYPE=$BuildType"
+            "-DCMAKE_MAKE_PROGRAM=$((Get-ToolPath 'ninja'))"
+            "-DCMAKE_C_COMPILER=$vsCl"
+            "-DCMAKE_CXX_COMPILER=$vsCl"
+            '-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded'
+        )
+    }
+    else {
+        $cmakeArgs += @('-A', 'x64')
+        # MSBuild 的 CL 任务在编译前要写一个「追踪文件」，记录本次读了哪些头文件。
+        # 某些环境里这一步会以 IOException 失败，表现为：
+        #   error MSB6003: 指定的任务可执行文件"CL.exe"未能运行。
+        #     在 Microsoft.Build.CPPTasks.TrackedVCToolTask...
+        # 报错完全看不出跟"写追踪文件"有关。所以无条件关掉追踪器 —— 代价只是失去
+        # 增量编译的依赖分析，而本项目都是全量编译，没有影响。
+        $cmakeArgs += '-DCMAKE_VS_GLOBALS=TrackFileAccess=false'
+        $noTracker = $true
+    }
     # MSVC 默认按系统代码页解析源文件，而 llama.cpp 是 UTF-8，会刷 C4819 警告。
     # 这里用 CL 环境变量追加，而不是 -DCMAKE_CXX_FLAGS：后者会整体替换 CMake 的
     # 默认 flags，否则会把 /EHsc 一起丢掉，导致每个用到 C++ 异常的编译单元报 C4530。
     $env:CL = if ($env:CL) { "$env:CL /utf-8" } else { '/utf-8' }
-    $noTracker = $false
-    try {
-        if ((& whoami /groups 2>$null | Out-String) -match 'S-1-16-4096') { $noTracker = $true }
-    } catch { }
-    if ($noTracker) {
-        Write-Warn '已关闭 MSBuild 文件追踪（TrackFileAccess=false）'
-        $cmakeArgs += '-DCMAKE_VS_GLOBALS=TrackFileAccess=false'
-        # 注意：多进程构建可能因节点通信未能建立而瞬间失败且无输出。
-        # 这里不擅自改写用户的并发设置，改为在编译阶段失败后自动降级重试。
-    }
     if ($Backend -contains 'CUDA') {
         $env:NVCC_PREPEND_FLAGS = if ($env:NVCC_PREPEND_FLAGS) { "$env:NVCC_PREPEND_FLAGS -Xcompiler=/utf-8" } else { '-Xcompiler=/utf-8' }
     }
-    # MSVC / MSBuild 的诊断消息是系统代码页编码的，在 UTF-8 控制台下会变成乱码，
-    # 这里直接让它们输出英文。
+    # MSVC / MSBuild 的诊断消息按系统代码页输出，在 UTF-8 控制台下会变成乱码。
+    # DOTNET_CLI_UI_LANGUAGE 能让 MSBuild 改说英文（实测有效），英文全是 ASCII，
+    # 不存在编码错配。cl.exe 不读这个变量，它的中文诊断换不掉。
+    if (-not $env:DOTNET_CLI_UI_LANGUAGE) { $env:DOTNET_CLI_UI_LANGUAGE = 'en-US' }
     if (-not $env:VSLANG) { $env:VSLANG = '1033' }
+    # MSBuild 并行构建时会在共享输出路径上产生竞争（文件占用 / 目录创建被拒）。
+    # 打开这个开关会让它在日志里记录更细的文件锁定信息，出问题时便于定位；
+    # 平时不产生额外输出，也不影响构建结果。
+    if (-not $env:MSBUILDDEBUGFILELOCKS) { $env:MSBUILDDEBUGFILELOCKS = '1' }
     if (-not $NoStatic) {
         # MSVC 下 -static 的等价物：静态链接 C 运行时
         $cmakeArgs += '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
@@ -891,23 +989,28 @@ Write-Ok '配置完成'
 Write-Section '7/8 编译'
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-if ($use -eq 'gcc') {
+# MSBuild 的 C++ 任务调度器（MultiToolTask）用一个「具名信号量」统计并发编译进程数。
+# 有些环境不允许创建这类内核对象，创建失败会以 MSB4018 终止整个项目，而报错只写
+# 「对端口的访问被拒绝」—— 完全看不出与并行有关。这两个属性把调度器内部并行和跨
+# 构建的进程计数一起关掉；项目级并行仍由 --parallel 控制。
+# 只有走 Visual Studio 生成器（MSBuild）时才需要，Ninja 用不到这些参数。
+$msbProps = @('/p:UseMultiToolTask=false', '/p:EnforceProcessCountAcrossBuilds=false')
+
+# 编译阶段始终并行：--parallel 对所有生成器都有效；CMAKE_BUILD_PARALLEL_LEVEL 作为
+# 兜底，第三方子构建（ExternalProject 之类）也会读它。
+$env:CMAKE_BUILD_PARALLEL_LEVEL = "$Jobs"
+
+# Ninja 和 MinGW Makefiles 都是单配置生成器：构建类型在配置期已给定，编译期不再传
+# --config；它们的构建工具也不认识 MSBuild 属性（-- 之后的参数会被当成工具自己的
+# 参数而报错）。只有 Visual Studio 生成器才需要那套参数。
+if ($useNinja -or $use -eq 'gcc') {
     Invoke-External { & cmake --build $BuildDir --parallel $Jobs }
 }
 else {
-    # 多配置生成器：配置在构建时才指定
-    Invoke-External { & cmake --build $BuildDir --config $BuildType --parallel $Jobs }
+    Invoke-External { & cmake --build $BuildDir --config $BuildType --parallel $Jobs -- @msbProps }
 }
 $code = $LASTEXITCODE
 
-    # MSBuild 的多进程节点通信可能未能建立，表现为瞬间失败且无任何输出。
-    # 这里改为失败后降为单线程重试，而不是事先篡改用户给的数值。
-    if ($code -ne 0 -and $Jobs -gt 1 -and $noTracker) {
-        Write-Warn "并发 $Jobs 构建失败，改用单线程重试"
-        if ($use -eq 'gcc') { Invoke-External { & cmake --build $BuildDir --parallel 1 } }
-        else { Invoke-External { & cmake --build $BuildDir --config $BuildType --parallel 1 } }
-        $code = $LASTEXITCODE
-    }
 $sw.Stop()
 
 if ($code -ne 0) { Write-Bad "编译失败（退出码 $code）"; exit $code }

@@ -61,6 +61,8 @@
 .NOTES
     The full compile flow of this script has not yet been run end-to-end on every
     toolchain combination. Run it once with -Backend CPU first.
+    Tip: if you run this script directly, use PowerShell 7 (pwsh); the default
+    execution policy of PowerShell 5.1 refuses to run scripts.
 #>
 
 [CmdletBinding()]
@@ -164,8 +166,9 @@ function Get-CMakeVersion {
     return $null
 }
 
-# Locate a Visual Studio install that carries the C++ toolset
 # Locate vswhere.exe. Besides the two standard locations, accept one already on PATH.
+# Visual Studio may live elsewhere, and the Installer's registered location may not be
+# one of the default paths.
 function Get-VsWherePath {
     $candidates = @(
         (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'),
@@ -177,6 +180,7 @@ function Get-VsWherePath {
     return $null
 }
 
+# Locate a Visual Studio install that carries the C++ toolset
 function Get-VisualStudioPath {
     $vswhere = Get-VsWherePath
     if ($vswhere) {
@@ -219,8 +223,6 @@ function Get-VisualStudioGenerator {
     }
     return $null
 }
-
-# ============================================================================
 
 # ============================================================================
 #  Logging: every line goes to the console AND to llm_install.log, identically
@@ -269,6 +271,7 @@ function Invoke-External ([scriptblock]$Command) {
         $ErrorActionPreference = $saved
     }
 }
+# ============================================================================
 #  0. Default parameter values
 # ============================================================================
 if (-not $SourceDir) {
@@ -513,7 +516,7 @@ if ($gdbPath) { Write-Ok "gdb  ->  $gdbPath" } else { Write-Warn 'gdb  not found
 Write-Log ''
 Write-Log '  MSVC (Visual Studio):' -ForegroundColor DarkGray
 if ($vsPath)      { Write-Ok "Visual Studio  ->  $vsPath" } else { Write-Warn 'Visual Studio with the C++ workload not found' }
-if ($vsGenerator) { Write-Ok "generator      ->  $vsGenerator" }
+if ($vsGenerator) { Write-Ok "VS generator   ->  $vsGenerator (used only when ninja is absent)" }
 if ($vsCl)        { Write-Ok "cl.exe         ->  $vsCl" }
 Write-Log ''
 Write-Log '  SDKs needed by the optional backends:' -ForegroundColor DarkGray
@@ -546,11 +549,42 @@ if ($use -eq 'gcc' -and -not $gdbPath) {
     Write-Warn 'gdb is missing: fine for building, but -BuildType Debug/RelWithDebInfo will have nothing to debug with'
 }
 
-# --- generator for the GCC path: ninja first, then mingw32-make / make ---
+# --- Generator selection: prefer ninja in all three cases ---
+# Ninja may be unable to create child processes in a restricted environment (a sandbox,
+# or some security software). It then hangs forever on the first try_compile during
+# configure, with no error at all. So probe once with a minimal task first, and fall
+# back to another generator if ninja cannot spawn: degrade, never hang silently.
+function Test-NinjaSpawn ([string]$NinjaPath) {
+    $probeDir = Join-Path ([System.IO.Path]::GetTempPath()) ('ninja_probe_' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $probeDir -Force -ErrorAction SilentlyContinue | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $probeDir 'build.ninja') -Encoding ascii -Value @'
+rule probe
+  command = cmd /c echo ok > probe.txt
+build probe.txt: probe
+'@
+        $proc = Start-Process -FilePath $NinjaPath -ArgumentList 'probe.txt' -WorkingDirectory $probeDir -PassThru -WindowStyle Hidden
+        if (-not $proc.WaitForExit(20000)) { try { $proc.Kill() } catch { }; return $false }
+        return (Test-Path -LiteralPath (Join-Path $probeDir 'probe.txt'))
+    }
+    catch { return $false }
+    finally { Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 $generator = $null
+$useNinja = $false
+$ninjaPath = Get-ToolPath 'ninja'
+$ninjaUsable = $false
+if ($ninjaPath) {
+    $ninjaUsable = Test-NinjaSpawn $ninjaPath
+    if (-not $ninjaUsable) {
+        Write-Warn 'ninja cannot spawn child processes (restricted sandbox or security software); not using Ninja this run'
+        Write-Note 'This normally does not happen when the script runs from a regular desktop terminal'
+    }
+}
 if ($use -eq 'gcc') {
-    if (Get-ToolPath 'ninja') {
-        $generator = 'Ninja'; Write-Ok "ninja  ->  $((Get-ToolPath 'ninja'))"
+    if ($ninjaUsable) {
+        $generator = 'Ninja'; $useNinja = $true; Write-Ok "ninja  ->  $ninjaPath"
     }
     elseif (Get-ToolPath 'mingw32-make') {
         $generator = 'MinGW Makefiles'; Write-Ok "mingw32-make  ->  $((Get-ToolPath 'mingw32-make'))"
@@ -559,14 +593,53 @@ if ($use -eq 'gcc') {
         $generator = 'MinGW Makefiles'; Write-Ok "make  ->  $((Get-ToolPath 'make'))"
     }
     else {
-        Write-Bad 'none of ninja / mingw32-make / make was found (GCC path needs one of them)'
+        Write-Bad 'the GCC path has no usable generator: ninja is unusable here and neither mingw32-make nor make was found'
         Write-Note 'MSYS2 UCRT64: pacman -S mingw-w64-ucrt-x86_64-ninja'
         $missing += 'ninja-or-make'
     }
 }
 else {
-    # The Visual Studio generator drives MSBuild itself, no ninja/make needed
-    $generator = $vsGenerator
+    # MSVC also prefers Ninja. The Visual Studio generator drives MSBuild, and MSBuild
+    # has a batch of problems under high parallelism: named semaphores (MSB4018),
+    # shared-directory creation races (MSB3191), the file tracker failing to write its
+    # tracking file (MSB6003), and linker temp files (LNK1104). Ninja uses atomic
+    # directory creation and creates none of those kernel objects, sidestepping all of
+    # them at once.
+    if ($ninjaUsable) {
+        $generator = 'Ninja'
+        $useNinja = $true
+        Write-Ok "ninja  ->  $ninjaPath"
+    }
+    else {
+        $generator = $vsGenerator
+        Write-Ok "Generator      ->  $vsGenerator (no usable ninja, staying on MSBuild)"
+    }
+}
+
+# When Ninja drives MSVC, the Visual Studio developer environment must be imported first.
+# The Visual Studio generator is driven by MSBuild, which brings the full environment
+# (INCLUDE / LIB / PATH all pointing into the Windows SDK). Ninja only gets a bare cl.exe
+# path from us, so the link step cannot find the resource compiler or the manifest tool:
+#     RC Pass 1: command "rc /fo .../manifest.res ..." failed
+#     no such file or directory
+# vcvars64.bat exists precisely to set that environment up; import its result here.
+if ($useNinja -and $use -ne 'gcc') {
+    $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+    if (Test-Path -LiteralPath $vcvars) {
+        $dump = & cmd /c "`"$vcvars`" >nul 2>&1 && set" 2>$null
+        $imported = 0
+        foreach ($line in $dump) {
+            if ($line -match '^([^=]+)=(.*)$') {
+                [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+                $imported++
+            }
+        }
+        Write-Ok "vcvars64.bat  ->  imported $imported environment variables"
+    }
+    else {
+        Write-Warn "vcvars64.bat not found; Ninja may fail to link for lack of rc.exe / mt.exe"
+        Write-Note "Expected at: $vcvars"
+    }
 }
 
 if ($missing.Count -gt 0) {
@@ -785,7 +858,9 @@ if (($Backend -contains 'OpenVINO') -and $ovSetup) {
     try { & $ovSetup 2>&1 | ForEach-Object { Write-Note "$_" } } catch { Write-Warn "setupvars.ps1 failed: $(($_.Exception.Message -split "`r?`n")[0])" }
 }
 
-$cmakeArgs = @('-S', $SourceDir, '-B', $BuildDir, '-G', $generator)
+# -Wno-dev suppresses CMake's developer warnings (for example CMP194 "MSVC is not an
+# assembler for language ASM"). Real errors are unaffected.
+$cmakeArgs = @('-S', $SourceDir, '-B', $BuildDir, '-G', $generator, '-Wno-dev')
 
 # FindOpenCL does not search the CUDA Toolkit on its own, so pass what we found
 if ($Backend -contains 'OpenVINO') {
@@ -813,32 +888,62 @@ elseif ($use -eq 'gcc') {
     }
 }
 else {
-    $cmakeArgs += @('-A', 'x64')
+    if ($useNinja) {
+        # Ninja is a single-configuration generator: the build type is given at
+        # configure time and there is no --config at build time. cl.exe is not on
+        # PATH, so both the compiler and ninja itself must be pointed at explicitly.
+        #
+        # The debug information format must be Embedded (/Z7). The default is
+        # ProgramDatabase (/Zi), which has cl.exe write a .pdb - and that write is not
+        # done by cl.exe itself but by the background service mspdbsrv.exe, over a
+        # NAMED PIPE. This machine refuses to create that class of kernel object, so
+        # the PDB can never be opened and it surfaces as:
+        #   fatal error C1041: cannot open program database "...\vc140.pdb";
+        #       if multiple CL.EXE write to the same .PDB, use /FS
+        # Adding /FS does not help: it only serializes PDB writes, it does not remove
+        # mspdbsrv.exe from the picture. With /Z7 the debug info goes straight into
+        # each .obj, no .pdb is involved at all, and the problem disappears.
+        $cmakeArgs += @(
+            "-DCMAKE_BUILD_TYPE=$BuildType"
+            "-DCMAKE_MAKE_PROGRAM=$((Get-ToolPath 'ninja'))"
+            "-DCMAKE_C_COMPILER=$vsCl"
+            "-DCMAKE_CXX_COMPILER=$vsCl"
+            '-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded'
+        )
+    }
+    else {
+        $cmakeArgs += @('-A', 'x64')
+        # MSBuild's CL task writes a "tracking file" before compiling, recording which
+        # headers it read. In some environments that write fails with an IOException and
+        # surfaces as:
+        #   error MSB6003: The specified task executable "CL.exe" could not be run.
+        #     at Microsoft.Build.CPPTasks.TrackedVCToolTask...
+        # Nothing in the message hints at the tracking file. So disable the tracker
+        # unconditionally - the only cost is incremental-build dependency analysis, and
+        # every build here is a full build.
+        $cmakeArgs += '-DCMAKE_VS_GLOBALS=TrackFileAccess=false'
+        $noTracker = $true
+    }
     # MSVC parses sources in the system code page by default and llama.cpp is
     # UTF-8, which floods the log with C4819 warnings.
     # Use the CL environment variable, NOT -DCMAKE_CXX_FLAGS: setting that cache
     # variable replaces CMake's default flags and silently drops /EHsc, which
     # then raises C4530 in every translation unit that uses C++ exceptions.
     $env:CL = if ($env:CL) { "$env:CL /utf-8" } else { '/utf-8' }
-    # The MSBuild file tracker reports bogus MSB6006/TRK0002 errors in some
-    # environments. Disabling tracking fixes it.
-    $noTracker = $false
-    try {
-        if ((& whoami /groups 2>$null | Out-String) -match 'S-1-16-4096') { $noTracker = $true }
-    } catch { }
-    if ($noTracker) {
-        Write-Warn 'Disabling the MSBuild file tracker (TrackFileAccess=false)'
-        $cmakeArgs += '-DCMAKE_VS_GLOBALS=TrackFileAccess=false'
-        # Note: a multi-process build can fail instantly with no output when the node
-        # handshake does not complete. The user's job count is left untouched; instead
-        # the build retries single-threaded if it fails.
-    }
     if ($Backend -contains 'CUDA') {
         $env:NVCC_PREPEND_FLAGS = if ($env:NVCC_PREPEND_FLAGS) { "$env:NVCC_PREPEND_FLAGS -Xcompiler=/utf-8" } else { '-Xcompiler=/utf-8' }
     }
-    # MSVC and MSBuild print localized diagnostics in the system code page, which
-    # turns into mojibake under a UTF-8 console. Ask them for English instead.
+    # MSVC and MSBuild print localized diagnostics in the system code page, which turns
+    # into mojibake under a UTF-8 console. DOTNET_CLI_UI_LANGUAGE makes MSBuild switch
+    # to English (measured working), and English output is pure ASCII so no mismatch is
+    # possible. cl.exe does not read this variable; its Chinese diagnostics stay.
+    if (-not $env:DOTNET_CLI_UI_LANGUAGE) { $env:DOTNET_CLI_UI_LANGUAGE = 'en-US' }
     if (-not $env:VSLANG) { $env:VSLANG = '1033' }
+    # MSBuild contends on shared output paths when building in parallel (file locks,
+    # directory creation denied). This switch makes it log fine-grained file locking
+    # detail, which helps pinpoint the conflict. It produces no extra output when
+    # nothing goes wrong and does not affect the build result.
+    if (-not $env:MSBUILDDEBUGFILELOCKS) { $env:MSBUILDDEBUGFILELOCKS = '1' }
     if (-not $NoStatic) {
         # The MSVC equivalent of -static: link the C runtime statically
         $cmakeArgs += '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
@@ -906,24 +1011,31 @@ Write-Ok 'Configure done'
 Write-Section '7/8 Build'
 
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-if ($use -eq 'gcc') {
+# MSBuild's C++ task scheduler (MultiToolTask) uses a NAMED SEMAPHORE to count
+# concurrent compiler processes. Some environments refuse to create such kernel
+# objects, and the failure surfaces as MSB4018 with only "access to the port is
+# denied" - no hint that parallelism is involved. These two properties turn off the
+# scheduler's internal parallelism and the cross-build process counter;
+# project-level parallelism is still governed by --parallel.
+$msbProps = @('/p:UseMultiToolTask=false', '/p:EnforceProcessCountAcrossBuilds=false')
+
+# The build always runs in parallel: --parallel works for every generator, and
+# CMAKE_BUILD_PARALLEL_LEVEL is set as a fallback that third-party sub-builds
+# (ExternalProject and friends) also honour.
+$env:CMAKE_BUILD_PARALLEL_LEVEL = "$Jobs"
+
+# Ninja and MinGW Makefiles are both single-configuration generators: the build type is
+# already fixed at configure time, so no --config here, and their build tools do not
+# accept MSBuild properties (anything after -- would be parsed by the tool itself and
+# fail). Only the Visual Studio generator needs those properties.
+if ($useNinja -or $use -eq 'gcc') {
     Invoke-External { & cmake --build $BuildDir --parallel $Jobs }
 }
 else {
-    # Multi-config generator: the configuration is chosen at build time
-    Invoke-External { & cmake --build $BuildDir --config $BuildType --parallel $Jobs }
+    Invoke-External { & cmake --build $BuildDir --config $BuildType --parallel $Jobs -- @msbProps }
 }
 $code = $LASTEXITCODE
 
-    # MSBuild's multi-process node handshake can fail without completing, which shows
-    # up as an instant failure with no output. Retry once single-threaded rather than
-    # overriding the job count the user asked for.
-    if ($code -ne 0 -and $Jobs -gt 1 -and $noTracker) {
-        Write-Warn "Build with $Jobs jobs failed; retrying single-threaded"
-        if ($use -eq 'gcc') { Invoke-External { & cmake --build $BuildDir --parallel 1 } }
-        else { Invoke-External { & cmake --build $BuildDir --config $BuildType --parallel 1 } }
-        $code = $LASTEXITCODE
-    }
 $sw.Stop()
 
 if ($code -ne 0) { Write-Bad "Build failed (exit code $code)"; exit $code }
