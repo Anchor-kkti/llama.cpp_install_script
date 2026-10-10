@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     llama.cpp one-click build script -- Windows / PowerShell edition
 
@@ -29,8 +29,13 @@
     -static, with MSVC it selects the non-DLL C runtime (MultiThreaded).
 
 .PARAMETER AvxVnni
-    Additionally enable -DGGML_AVX_VNNI=ON (Intel 12th gen and later; gains vary by
-    machine, measure it yourself).
+    Force -DGGML_AVX_VNNI=ON. On the MSVC path the script already detects AVX-VNNI on
+    the build machine and enables it automatically; this switch is only needed when
+    that detection is unavailable (Windows PowerShell 5.1).
+
+.PARAMETER Lto
+    Enable link time optimization (-DGGML_LTO=ON). Slower builds and more memory;
+    gains vary by project, so it is off by default.
 
 .PARAMETER WithTests
     Build tests and run ctest (off by default to save build time).
@@ -86,6 +91,7 @@ param(
 
     [switch]   $NoStatic,
     [switch]   $AvxVnni,
+    [switch]   $Lto,
     [switch]   $WithTests,
     [switch]   $NoVerify,
     [switch]   $NonInteractive,
@@ -164,6 +170,25 @@ function Get-CMakeVersion {
     $line = (& cmake --version 2>&1 | Select-Object -First 1)
     if ("$line" -match '(\d+\.\d+(\.\d+)?)') { return [version]$Matches[1] }
     return $null
+}
+
+# Query whether the CPU supports an instruction set extension. Only .NET 5+ exposes
+# System.Runtime.Intrinsics; Windows PowerShell 5.1 does not, and this then returns
+# $null meaning "unknown" - callers must treat that as unknown, never as supported.
+function Get-IntrinsicSupported ([string]$TypeName) {
+    $full = "System.Runtime.Intrinsics.X86.$TypeName"
+    $t = $null
+    try { $t = [System.Type]::GetType("$full, System.Runtime.Intrinsics") } catch { }
+    if (-not $t) {
+        foreach ($a in [AppDomain]::CurrentDomain.GetAssemblies()) {
+            $t = $a.GetType($full)
+            if ($t) { break }
+        }
+    }
+    if (-not $t) { return $null }
+    $p = $t.GetProperty('IsSupported')
+    if (-not $p) { return $null }
+    return [bool]$p.GetValue($null)
 }
 
 # Locate vswhere.exe. Besides the two standard locations, accept one already on PATH.
@@ -303,8 +328,9 @@ Write-Section '1/8 Toolchain check'
 
 # --- CMake itself is required either way ---
 $missing = @()
-if (Get-ToolPath 'cmake') {
-    Write-Ok "cmake  ->  $((Get-ToolPath 'cmake'))"
+$cmakePath = Get-ToolPath 'cmake'
+if ($cmakePath) {
+    Write-Ok "cmake  ->  $cmakePath"
     $cv = Get-CMakeVersion
     if ($cv -and $cv -ge [version]'3.14') { Write-Ok "cmake version $cv (>= 3.14 OK)" }
     else { Write-Bad "cmake version $cv is too old; llama.cpp requires >= 3.14"; $missing += 'cmake-version' }
@@ -421,8 +447,6 @@ foreach ($r in ($oclRoots | Where-Object { $_ } | Select-Object -Unique)) {
     }
     if ($openclInc -and $openclLib) { break }
 }
-# a header set that has cl.h but not cl2.hpp is not usable by ggml-openvino
-if ($openclInc -and -not (Test-Path (Join-Path $openclInc 'CL\cl2.hpp'))) { $openclInc = $null }
 $openclReady = [bool]($openclInc -and $openclLib)
 
 # --- Intel NPU (AI Boost) hardware ---
@@ -586,16 +610,17 @@ if ($use -eq 'gcc') {
     if ($ninjaUsable) {
         $generator = 'Ninja'; $useNinja = $true; Write-Ok "ninja  ->  $ninjaPath"
     }
-    elseif (Get-ToolPath 'mingw32-make') {
-        $generator = 'MinGW Makefiles'; Write-Ok "mingw32-make  ->  $((Get-ToolPath 'mingw32-make'))"
-    }
-    elseif (Get-ToolPath 'make') {
-        $generator = 'MinGW Makefiles'; Write-Ok "make  ->  $((Get-ToolPath 'make'))"
-    }
     else {
-        Write-Bad 'the GCC path has no usable generator: ninja is unusable here and neither mingw32-make nor make was found'
-        Write-Note 'MSYS2 UCRT64: pacman -S mingw-w64-ucrt-x86_64-ninja'
-        $missing += 'ninja-or-make'
+        $makePath = Get-ToolPath 'mingw32-make'
+        if (-not $makePath) { $makePath = Get-ToolPath 'make' }
+        if ($makePath) {
+            $generator = 'MinGW Makefiles'; Write-Ok "make  ->  $makePath"
+        }
+        else {
+            Write-Bad 'the GCC path has no usable generator: ninja is unusable here and neither mingw32-make nor make was found'
+            Write-Note 'MSYS2 UCRT64: pacman -S mingw-w64-ucrt-x86_64-ninja'
+            $missing += 'ninja-or-make'
+        }
     }
 }
 else {
@@ -829,9 +854,16 @@ else {
 Write-Section '5/8 Build arguments'
 
 if (-not $BuildDir) {
-    $suffix = ($Backend -join '-').ToLower()
+    # Sort the backend names so the same set never ends up in two different directories
+    $suffix = (($Backend | Sort-Object) -join '-').ToLower()
+    # Single-configuration generators (Ninja / MinGW Makefiles) carry the build type in
+    # the directory name, so switching mode does not mix caches in one tree. Visual
+    # Studio is multi-configuration and keeps Debug/Release in one directory, so it
+    # must not get a mode suffix.
+    $modeTag = ''
+    if ($useNinja -or $use -eq 'gcc') { $modeTag = '-' + $BuildType.ToLower() }
     # The build directory follows the current working directory as well
-    $BuildDir = Join-Path (Get-Location).ProviderPath "build-$suffix-$use"
+    $BuildDir = Join-Path (Get-Location).ProviderPath "build-$suffix-$use$modeTag"
 }
 $BuildDir = [System.IO.Path]::GetFullPath($BuildDir)
 
@@ -850,7 +882,10 @@ if (($use -eq 'msvc') -and -not $NoStatic) {
     $NoStatic = $true
 }
 $useOneApi = ($Backend -contains 'SYCL') -and $oneApiReady
-if ($useOneApi -and (Get-ToolPath 'ninja')) { $generator = 'Ninja' }
+# The oneAPI path needs Ninja too, but $useNinja must be set as well: changing only
+# $generator leaves the build passing --config and MSBuild properties, which Ninja
+# rejects.
+if ($useOneApi -and $ninjaUsable) { $generator = 'Ninja'; $useNinja = $true }
 
 # OpenVINO needs its environment sourced first (sets OpenVINO_DIR and PATH)
 if (($Backend -contains 'OpenVINO') -and $ovSetup) {
@@ -905,7 +940,7 @@ else {
         # each .obj, no .pdb is involved at all, and the problem disappears.
         $cmakeArgs += @(
             "-DCMAKE_BUILD_TYPE=$BuildType"
-            "-DCMAKE_MAKE_PROGRAM=$((Get-ToolPath 'ninja'))"
+            "-DCMAKE_MAKE_PROGRAM=$ninjaPath"
             "-DCMAKE_C_COMPILER=$vsCl"
             "-DCMAKE_CXX_COMPILER=$vsCl"
             '-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded'
@@ -922,7 +957,6 @@ else {
         # unconditionally - the only cost is incremental-build dependency analysis, and
         # every build here is a full build.
         $cmakeArgs += '-DCMAKE_VS_GLOBALS=TrackFileAccess=false'
-        $noTracker = $true
     }
     # MSVC parses sources in the system code page by default and llama.cpp is
     # UTF-8, which floods the log with C4819 warnings.
@@ -960,7 +994,7 @@ if (($Backend -contains 'CUDA') -and $nvccPath) {
     # The VS/MSBuild CUDA integration reads the versioned CUDA_PATH_V<major>_<minor>,
     # not the generic CUDA_PATH. A freshly installed toolkit sets it machine-wide
     # only, so a session started before the install still sees nothing. Import it.
-    foreach ($n in @([Environment]::GetEnvironmentVariables('Machine').Keys)) {
+    foreach ($n in [Environment]::GetEnvironmentVariables('Machine').Keys) {
         if ($n -like 'CUDA_PATH*') {
             [Environment]::SetEnvironmentVariable($n, [Environment]::GetEnvironmentVariable($n, 'Machine'), 'Process')
         }
@@ -985,7 +1019,24 @@ if (($Backend -contains 'CUDA') -and $nvccPath) {
     }
 }
 
-if ($AvxVnni) { $cmakeArgs += '-DGGML_AVX_VNNI=ON' }
+# AVX-VNNI: MSVC's /arch:AVX2 does not include VNNI, while GCC's -march=native
+# already does, so this is added for the MSVC path only. The build machine has to
+# really support it - running the result on a CPU without VNNI crashes with an
+# illegal instruction - so when the check is unavailable the flag is left out.
+$vnniOn = $false
+if ($AvxVnni) { $vnniOn = $true }
+elseif ($use -eq 'msvc' -and -not $useOneApi) {
+    $vnniSupport = Get-IntrinsicSupported 'AvxVnni'
+    if ($vnniSupport -eq $true) {
+        $vnniOn = $true
+        Write-Note 'AVX-VNNI detected on this machine; enabling -DGGML_AVX_VNNI=ON'
+    }
+    elseif ($null -eq $vnniSupport) {
+        Write-Note 'Cannot detect AVX-VNNI from this PowerShell; add -AvxVnni if the CPU supports it'
+    }
+}
+if ($vnniOn) { $cmakeArgs += '-DGGML_AVX_VNNI=ON' }
+if ($Lto) { $cmakeArgs += '-DGGML_LTO=ON' }
 if (-not $WithTests) { $cmakeArgs += '-DLLAMA_BUILD_TESTS=OFF' }
 
 Write-Note "Toolchain : $use"

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     llama.cpp 编译脚本 —— Windows / PowerShell 版
 
@@ -27,7 +27,11 @@
     （MultiThreaded）。
 
 .PARAMETER AvxVnni
-    额外开启 -DGGML_AVX_VNNI=ON（Intel 12 代及以后支持；收益因机器而异，需自己实测）。
+    强制开启 -DGGML_AVX_VNNI=ON。MSVC 路径下脚本会先检测构建机是否支持 AVX-VNNI
+    并自动启用；只有在检测不可用（Windows PowerShell 5.1）时才需要这个开关。
+
+.PARAMETER Lto
+    开启链接期优化 -DGGML_LTO=ON。编译更慢、更吃内存，收益因项目而异，默认关闭。
 
 .PARAMETER WithTests
     编译 tests 并运行 ctest（默认关闭，节省编译时间）。
@@ -81,6 +85,7 @@ param(
 
     [switch]   $NoStatic,
     [switch]   $AvxVnni,
+    [switch]   $Lto,
     [switch]   $WithTests,
     [switch]   $NoVerify,
     [switch]   $NonInteractive,
@@ -159,6 +164,24 @@ function Get-CMakeVersion {
     $line = (& cmake --version 2>&1 | Select-Object -First 1)
     if ("$line" -match '(\d+\.\d+(\.\d+)?)') { return [version]$Matches[1] }
     return $null
+}
+
+# 查询 CPU 是否支持某个指令集扩展。只有 .NET 5+ 才暴露 System.Runtime.Intrinsics，
+# Windows PowerShell 5.1 没有，这时返回 $null 表示「未知」——调用方必须按未知处理。
+function Get-IntrinsicSupported ([string]$TypeName) {
+    $full = "System.Runtime.Intrinsics.X86.$TypeName"
+    $t = $null
+    try { $t = [System.Type]::GetType("$full, System.Runtime.Intrinsics") } catch { }
+    if (-not $t) {
+        foreach ($a in [AppDomain]::CurrentDomain.GetAssemblies()) {
+            $t = $a.GetType($full)
+            if ($t) { break }
+        }
+    }
+    if (-not $t) { return $null }
+    $p = $t.GetProperty('IsSupported')
+    if (-not $p) { return $null }
+    return [bool]$p.GetValue($null)
 }
 
 # 定位 vswhere.exe。除两个标准位置外，也接受已经在 PATH 里的那份：
@@ -297,8 +320,9 @@ Write-Section '1/8 工具链检查'
 
 # --- 无论走哪条路，CMake 都必须有 ---
 $missing = @()
-if (Get-ToolPath 'cmake') {
-    Write-Ok "cmake  ->  $((Get-ToolPath 'cmake'))"
+$cmakePath = Get-ToolPath 'cmake'
+if ($cmakePath) {
+    Write-Ok "cmake  ->  $cmakePath"
     $cv = Get-CMakeVersion
     if ($cv -and $cv -ge [version]'3.14') { Write-Ok "cmake 版本 $cv （>= 3.14 满足）" }
     else { Write-Bad "cmake 版本 $cv 过低，llama.cpp 要求 >= 3.14"; $missing += 'cmake-version' }
@@ -412,8 +436,6 @@ foreach ($r in ($oclRoots | Where-Object { $_ } | Select-Object -Unique)) {
     }
     if ($openclInc -and $openclLib) { break }
 }
-# 只有 cl.h 没有 cl2.hpp 的头文件集，ggml-openvino 用不了
-if ($openclInc -and -not (Test-Path (Join-Path $openclInc 'CL\cl2.hpp'))) { $openclInc = $null }
 $openclReady = [bool]($openclInc -and $openclLib)
 
 # --- Intel NPU（AI Boost）硬件 ---
@@ -576,16 +598,17 @@ if ($use -eq 'gcc') {
     if ($ninjaUsable) {
         $generator = 'Ninja'; $useNinja = $true; Write-Ok "ninja  ->  $ninjaPath"
     }
-    elseif (Get-ToolPath 'mingw32-make') {
-        $generator = 'MinGW Makefiles'; Write-Ok "mingw32-make  ->  $((Get-ToolPath 'mingw32-make'))"
-    }
-    elseif (Get-ToolPath 'make') {
-        $generator = 'MinGW Makefiles'; Write-Ok "make  ->  $((Get-ToolPath 'make'))"
-    }
     else {
-        Write-Bad 'GCC 路线没有可用生成器：ninja 在此环境不可用，也没找到 mingw32-make / make'
-        Write-Note 'MSYS2 UCRT64: pacman -S mingw-w64-ucrt-x86_64-ninja'
-        $missing += 'ninja-or-make'
+        $makePath = Get-ToolPath 'mingw32-make'
+        if (-not $makePath) { $makePath = Get-ToolPath 'make' }
+        if ($makePath) {
+            $generator = 'MinGW Makefiles'; Write-Ok "make  ->  $makePath"
+        }
+        else {
+            Write-Bad 'GCC 路线没有可用生成器：ninja 在此环境不可用，也没找到 mingw32-make / make'
+            Write-Note 'MSYS2 UCRT64: pacman -S mingw-w64-ucrt-x86_64-ninja'
+            $missing += 'ninja-or-make'
+        }
     }
 }
 else {
@@ -817,9 +840,15 @@ else {
 Write-Section '5/8 组装构建参数'
 
 if (-not $BuildDir) {
-    $suffix = ($Backend -join '-').ToLower()
+    # 后端名先排序再拼，避免同一组后端因为输入顺序不同而生成两个目录
+    $suffix = (($Backend | Sort-Object) -join '-').ToLower()
+    # 单配置生成器（Ninja / MinGW Makefiles）把构建模式写进目录名：换模式时不会跟
+    # 上一个模式的缓存混在同一个目录里。Visual Studio 是多配置生成器，一个目录本来
+    # 就同时容纳 Debug/Release，绝不能加模式后缀。
+    $modeTag = ''
+    if ($useNinja -or $use -eq 'gcc') { $modeTag = '-' + $BuildType.ToLower() }
     # 构建目录同样跟着当前工作目录
-    $BuildDir = Join-Path (Get-Location).ProviderPath "build-$suffix-$use"
+    $BuildDir = Join-Path (Get-Location).ProviderPath "build-$suffix-$use$modeTag"
 }
 $BuildDir = [System.IO.Path]::GetFullPath($BuildDir)
 
@@ -837,7 +866,9 @@ if (($use -eq 'msvc') -and -not $NoStatic) {
     $NoStatic = $true
 }
 $useOneApi = ($Backend -contains 'SYCL') -and $oneApiReady
-if ($useOneApi -and (Get-ToolPath 'ninja')) { $generator = 'Ninja' }
+# oneAPI 路径同样要用 Ninja，但必须连 $useNinja 一起置位：只改 $generator 的话，
+# build 阶段仍会按 Visual Studio 生成器传 --config 与 MSBuild 属性，Ninja 直接报错。
+if ($useOneApi -and $ninjaUsable) { $generator = 'Ninja'; $useNinja = $true }
 
 # OpenVINO 需要先把它的环境引进本进程（设置 OpenVINO_DIR 和 PATH）
 if (($Backend -contains 'OpenVINO') -and $ovSetup) {
@@ -890,7 +921,7 @@ else {
         # 改 /Z7 后调试信息直接嵌进各 .obj，完全不碰 .pdb，问题从根上消失。
         $cmakeArgs += @(
             "-DCMAKE_BUILD_TYPE=$BuildType"
-            "-DCMAKE_MAKE_PROGRAM=$((Get-ToolPath 'ninja'))"
+            "-DCMAKE_MAKE_PROGRAM=$ninjaPath"
             "-DCMAKE_C_COMPILER=$vsCl"
             "-DCMAKE_CXX_COMPILER=$vsCl"
             '-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded'
@@ -905,7 +936,6 @@ else {
         # 报错完全看不出跟"写追踪文件"有关。所以无条件关掉追踪器 —— 代价只是失去
         # 增量编译的依赖分析，而本项目都是全量编译，没有影响。
         $cmakeArgs += '-DCMAKE_VS_GLOBALS=TrackFileAccess=false'
-        $noTracker = $true
     }
     # MSVC 默认按系统代码页解析源文件，而 llama.cpp 是 UTF-8，会刷 C4819 警告。
     # 这里用 CL 环境变量追加，而不是 -DCMAKE_CXX_FLAGS：后者会整体替换 CMake 的
@@ -939,7 +969,7 @@ if (($Backend -contains 'CUDA') -and $nvccPath) {
     # VS/MSBuild 的 CUDA 集成读的是版本化变量 CUDA_PATH_V<主>_<次>，不是通用的
     # CUDA_PATH。刚装好的 CUDA 只在机器级设置它，所以装之前就启动的会话里是空的，
     # 这里直接把它导入本进程。
-    foreach ($n in @([Environment]::GetEnvironmentVariables('Machine').Keys)) {
+    foreach ($n in [Environment]::GetEnvironmentVariables('Machine').Keys) {
         if ($n -like 'CUDA_PATH*') {
             [Environment]::SetEnvironmentVariable($n, [Environment]::GetEnvironmentVariable($n, 'Machine'), 'Process')
         }
@@ -963,7 +993,23 @@ if (($Backend -contains 'CUDA') -and $nvccPath) {
     }
 }
 
-if ($AvxVnni) { $cmakeArgs += '-DGGML_AVX_VNNI=ON' }
+# AVX-VNNI：MSVC 的 /arch:AVX2 不含 VNNI，而 GCC 的 -march=native 已经覆盖它，
+# 所以只给 MSVC 路径补。必须确认构建机真的支持 —— 在不支持的 CPU 上跑会直接
+# 崩（非法指令），所以检测不到就宁可不加。
+$vnniOn = $false
+if ($AvxVnni) { $vnniOn = $true }
+elseif ($use -eq 'msvc' -and -not $useOneApi) {
+    $vnniSupport = Get-IntrinsicSupported 'AvxVnni'
+    if ($vnniSupport -eq $true) {
+        $vnniOn = $true
+        Write-Note '检测到本机支持 AVX-VNNI，已自动开启 -DGGML_AVX_VNNI=ON'
+    }
+    elseif ($null -eq $vnniSupport) {
+        Write-Note '当前 PowerShell 无法检测 AVX-VNNI；若 CPU 支持可加 -AvxVnni 手动开启'
+    }
+}
+if ($vnniOn) { $cmakeArgs += '-DGGML_AVX_VNNI=ON' }
+if ($Lto) { $cmakeArgs += '-DGGML_LTO=ON' }
 if (-not $WithTests) { $cmakeArgs += '-DLLAMA_BUILD_TESTS=OFF' }
 
 Write-Note "工具链   : $use"
